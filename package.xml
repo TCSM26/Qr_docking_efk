@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>qr_dock_kf</name>
+  <version>0.1.0</version>
+  <description>
+    Kalman-filtered QR docking for the TCSM Puzzlebot forklift.
+
+    Self-contained alternative to robot_dock_twostep. Detects a QR with
+    cv2.QRCodeDetector + IPPE (two-solution disambiguation), tracks the marker
+    pose with a 3-DOF (x, y, yaw) Kalman filter driven by the robot's own
+    ego-motion (so it keeps a valid estimate while the QR is briefly lost), and
+    docks via a waypoint-on-the-normal state machine that re-references the QR
+    up close. The yaw measurement is deliberately distrusted (large R_yaw);
+    perpendicularity comes from routing through a waypoint on the QR's outward
+    normal rather than from the noisy instantaneous plane-yaw.
+
+    Does NOT modify the EKF / MCL / ArUco localization stack. Publishes to
+    alignment_cmd_vel (merged in cmd_vel_mux) and /align/done, like the other
+    aligners. Inspired by dawan0111/Auto-Marker-Docking.
+  </description>
+  <maintainer email="edrickgv05@gmail.com">edrick</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>custom_interfaces</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

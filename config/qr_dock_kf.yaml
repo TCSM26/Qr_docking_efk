@@ -1,0 +1,66 @@
+qr_dock_kf_node:
+  ros__parameters:
+    # ---- I/O ----
+    image_topic: "/image_raw"
+    odom_topic: "/odometry/filtered"
+    cmd_vel_topic: "alignment_cmd_vel"
+    done_topic: "/align/done"
+    mode_topic: "/align/mode"
+    activate_mode: "dock_qr_kf"
+    enable_service: "/qr_dock_kf/enable"
+    use_odom_twist: true
+
+    # ---- camera / QR ----
+    # Point calib_path at your npz (e.g. the *_PERFECT.npz) for real runs.
+    calib_path: ""
+    default_qr_size_mm: 97.0
+    qr_size_overrides: ""
+    cam_x_offset_m: 0.14
+    cam_y_offset_m: 0.0
+    cam_z_offset_m: 0.205
+    cam_pitch_deg: 0.0
+
+    # ---- measurement gating ----
+    warmup_frames: 8
+    max_reproj_px: 6.0
+    max_jump_m: 0.30
+    max_jump_rad: 1.2
+    loss_timeout_s: 2.0
+
+    # ---- Kalman filter ----
+    # measure_cov: yaw (3rd) is intentionally MUCH larger than x,y -> the
+    # filter distrusts the instantaneous plane-yaw and leans on ego-motion.
+    init_cov: [0.05, 0.05, 0.20]
+    predict_cov: [0.005, 0.005, 0.002]
+    measure_cov: [0.004, 0.004, 0.20]
+
+    # ---- docking geometry / control ----
+    waypoint_dist_m: 0.25
+    marker_gap_m: 0.18
+    tol_lat_m: 0.02
+    tol_fwd_m: 0.03
+    stable_time_s: 0.4
+
+    # Open-loop final advance once the QR is too close to detect (overflows the
+    # FOV). Latches the remaining distance and drives it straight by odometry.
+    commit_enable: true
+    commit_loss_s: 0.8           # vision age that arms the commit
+    commit_trigger_dist_m: 0.35  # only commit when at least this close
+    commit_lat_tol_m: 0.06       # require lateral alignment before committing
+    commit_speed: 0.04
+    commit_max_dist_m: 0.40      # safety clamp on the open-loop advance
+
+    kp_lin: 0.6
+    kd_lin: 0.02
+    kp_ang: 1.2
+    kd_ang: 0.02
+    max_lin_speed: 0.08
+    max_ang_speed: 0.30
+    min_lin_speed: 0.0
+    min_ang_speed: 0.02
+    approach_angle_gate_rad: 0.30
+
+    control_rate_hz: 30.0
+    publish_debug_image: true
+    debug_image_rate_hz: 10.0
+    start_enabled: false

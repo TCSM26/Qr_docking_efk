@@ -1,0 +1,9 @@
+# Python / ROS2 build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+install/
+log/
+.pytest_cache/
+*.swp
