@@ -65,6 +65,31 @@ OBSERVE ──▶ NAV_MAP ──▶ REFINE ──▶ COMMIT ──▶ DONE
 
 ---
 
+## Fuente de la pose del QR: interna vs. on-Jetson (`/qr/pose`)
+
+El nodo puede obtener la pose del QR de dos formas (`qr_pose_source`):
+
+- **`internal`** (default): detecta y hace `solvePnP` sobre la imagen aquí mismo.
+  Útil en sim o sin la Jetson. Detecta sobre la imagen **downsized**.
+- **`external`**: consume **`/qr/pose`** del nodo on-Jetson
+  (`optimized_camera_node_undistort_qr` del paquete `qr_detection`), que detecta
+  sobre el frame **full-size** → mejor pose, y descarga al PC. El nodo:
+  - transforma `/qr/pose` (frame `camera`) a `base`/`map` con **TF**,
+  - filtra por `target_qr_id` (payload `{"id": N}`),
+  - usa `qr_normal_axis` (`x` por defecto, la convención de `qr_detection`:
+    +X sale de la cara del QR) para la normal,
+  - enciende/apaga la detección de la Jetson publicando en **`/qr_enable`**
+    (`1` al activar, `0` al terminar) si `manage_qr_enable=true`.
+
+  **Requisito:** el frame de `/qr/pose` (`camera`) debe estar en el árbol TF
+  (URDF / EKF / la TF estática que publica `qr_debug_viz`). Validado en sim:
+  dockea con 0.5–0.9 cm igual que el path interno.
+
+  ```bash
+  ros2 launch qr_dock_kf dock_with_localization.launch.py \
+      qr_pose_source:=external target_qr_id:=1 qr_normal_axis:=x
+  ```
+
 ## Interfaz (`qr_dock_map_node`)
 
 | Dirección | Nombre | Tipo |
@@ -153,6 +178,45 @@ ros2 topic pub -1 /align/mode std_msgs/msg/String "{data: dock_qr_map}"
 - [ ] Ajustar `pregrasp_dist_m` al rango de detección de tu QR de 97 mm.
 
 ---
+
+## Checklist de verificación de TF (al conectar la Jetson)
+
+El modo `external` necesita que `/qr/pose` (frame `camera`) sea **TF-resoluble**
+hasta `base_footprint` y `map`. Verifica en este orden:
+
+```bash
+# 1) ¿Llega la pose y el payload de la Jetson? (recuerda /qr_enable=1)
+ros2 topic pub /qr_enable std_msgs/msg/Int32 "{data: 1}" --once
+ros2 topic echo --once /qr/pose      # ¿hay PoseStamped? anota header.frame_id (ej. "camera")
+ros2 topic echo --once /qr/data      # ¿{"id": N}?
+
+# 2) ¿El frame de /qr/pose está en el árbol TF?
+ros2 run tf2_tools view_frames       # genera frames.pdf; busca "camera" conectado
+ros2 run tf2_ros tf2_echo base_footprint camera   # ¿resuelve sin error?
+ros2 run tf2_ros tf2_echo map base_footprint      # ¿la localización publica esto?
+
+# 3) Cadena completa que usa el docking:
+ros2 run tf2_ros tf2_echo map camera   # map -> camera debe resolver
+```
+
+Reglas:
+- Si `tf2_echo base_footprint camera` falla → falta publicar `base_link→camera`.
+  Lo publica `qr_debug_viz` (`use_static_tf:=true`) o ponlo en el URDF/EKF.
+- Si el `frame_id` de `/qr/pose` no es `camera` (p. ej. `camera_link`), no
+  pasa nada: el nodo usa el `frame_id` que venga en el mensaje. Solo asegúrate
+  de que **ese** frame esté en el TF.
+- Si `tf2_echo map base_footprint` falla → la localización (EKF/MCL/ArUco o
+  QR) no está corriendo o no converge. Para una primera prueba usa
+  `dock_odom_only.launch.py` (pone `map=odom`, no necesita ArUcos).
+- Si dockea pero queda girado ~180° o la normal sale rara → prueba
+  `qr_normal_axis:=z`.
+
+Sanity de detección (independiente del TF):
+```bash
+ros2 launch qr_detection qr_debug_viz.launch.py \
+  image_topic:=/image_raw/compressed use_compressed_image:=true
+# en RViz: /qr/debug_image (polígono+texto) y /qr/pose_marker (cubo)
+```
 
 ## Contenido del paquete
 

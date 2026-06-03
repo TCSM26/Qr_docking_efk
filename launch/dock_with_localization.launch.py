@@ -38,6 +38,9 @@ def generate_launch_description():
     calib_path = LaunchConfiguration('calib_path')
     image_topic = LaunchConfiguration('image_topic')
     use_compressed_image = LaunchConfiguration('use_compressed_image')
+    qr_pose_source = LaunchConfiguration('qr_pose_source')
+    target_qr_id = LaunchConfiguration('target_qr_id')
+    qr_normal_axis = LaunchConfiguration('qr_normal_axis')
     use_rviz = LaunchConfiguration('use_rviz')
 
     # ---- Global localization (EKF + MCL + ArUco) -> TF map->base_footprint ----
@@ -55,6 +58,12 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[{
+            # QR pose source. 'external' = consume the on-Jetson /qr/pose
+            # (full-res detection). Requires the /qr/pose frame ('camera') to be
+            # in the TF tree (URDF / EKF / qr_debug_viz static TF).
+            'qr_pose_source': qr_pose_source,
+            'target_qr_id': target_qr_id,
+            'qr_normal_axis': qr_normal_axis,
             'image_topic': image_topic,
             'use_compressed_image': use_compressed_image,
             'odom_topic': '/odometry/filtered',
@@ -73,6 +82,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'qr_pose_source', default_value='external',
+            description="'external' = on-Jetson /qr/pose; 'internal' = detect here."),
+        DeclareLaunchArgument('target_qr_id', default_value=''),
+        DeclareLaunchArgument('qr_normal_axis', default_value='x'),
         DeclareLaunchArgument('calib_path', default_value=''),
         DeclareLaunchArgument('image_topic', default_value='/image_raw'),
         DeclareLaunchArgument(

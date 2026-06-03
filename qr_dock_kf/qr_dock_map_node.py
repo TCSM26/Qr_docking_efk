@@ -41,12 +41,15 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image, CompressedImage
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, PoseStamped, Quaternion
-from std_msgs.msg import Bool, String, ColorRGBA
+from std_msgs.msg import Bool, String, ColorRGBA, Int32
 from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 
+from rclpy.duration import Duration
+from rcl_interfaces.msg import ParameterDescriptor
 from tf2_ros import Buffer, TransformListener, LookupException, \
     ConnectivityException, ExtrapolationException
+import tf2_geometry_msgs  # noqa: F401  (registers PoseStamped transform support)
 
 try:
     from custom_interfaces.srv import SetProcessBool
@@ -89,6 +92,18 @@ class QRDockMapNode(Node):
         super().__init__("qr_dock_map_node")
 
         # ---- I/O ----
+        # QR pose source:
+        #   "internal" -> detect & solvePnP on the image here (default; sim).
+        #   "external" -> consume the on-Jetson /qr/pose (full-res detection),
+        #                 transformed via TF. Better and offloads the PC.
+        self.declare_parameter("qr_pose_source", "internal")
+        self.declare_parameter("qr_pose_topic", "/qr/pose")
+        self.declare_parameter("qr_data_topic", "/qr/data")
+        self.declare_parameter("target_qr_id", "",        # "" = accept any QR
+                               ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter("qr_normal_axis", "x")     # QR outward-face axis
+        self.declare_parameter("manage_qr_enable", True)  # toggle /qr_enable
+        self.declare_parameter("qr_enable_topic", "/qr_enable")
         self.declare_parameter("image_topic", "/image_raw")
         self.declare_parameter("use_compressed_image", False)
         self.declare_parameter("odom_topic", "/odometry/filtered")
@@ -155,6 +170,14 @@ class QRDockMapNode(Node):
         g = lambda n: self.get_parameter(n).value
         self.image_topic = g("image_topic")
         self.use_compressed = bool(g("use_compressed_image"))
+        self.qr_pose_source = str(g("qr_pose_source")).lower()
+        self.qr_pose_topic = g("qr_pose_topic")
+        self.qr_data_topic = g("qr_data_topic")
+        self.target_qr_id = str(g("target_qr_id")).strip()
+        self.qr_normal_axis = str(g("qr_normal_axis")).lower()
+        self.manage_qr_enable = bool(g("manage_qr_enable"))
+        self.qr_enable_topic = g("qr_enable_topic")
+        self.last_qr_payload_id = None
         self.odom_topic = g("odom_topic")
         self.cmd_vel_topic = g("cmd_vel_topic")
         self.done_topic = g("done_topic")
@@ -234,7 +257,17 @@ class QRDockMapNode(Node):
 
         sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                 history=HistoryPolicy.KEEP_LAST, depth=1)
-        if self.use_compressed:
+        self.pub_qr_enable = None
+        if self.qr_pose_source == "external":
+            # Consume the on-Jetson full-res QR pose; no local image processing.
+            self.create_subscription(PoseStamped, self.qr_pose_topic,
+                                     self._on_qr_pose, sensor_qos)
+            self.create_subscription(String, self.qr_data_topic,
+                                     self._on_qr_data, 10)
+            if self.manage_qr_enable:
+                self.pub_qr_enable = self.create_publisher(
+                    Int32, self.qr_enable_topic, 10)
+        elif self.use_compressed:
             self.create_subscription(CompressedImage, self.image_topic,
                                      self._on_image_compressed, sensor_qos)
         else:
@@ -308,13 +341,20 @@ class QRDockMapNode(Node):
         self.in_tol_since = None
         self.commit_start = None
         self.done_latched = False
+        self.last_qr_payload_id = None
         self._publish_zero()
+        self._set_qr_enable(1)          # turn on the on-Jetson QR detection
         self.get_logger().info("qr_dock_map ENABLED -> OBSERVE")
 
     def _stop(self):
         self.enabled = False
         self.phase = Phase.IDLE
         self._publish_zero()
+        self._set_qr_enable(0)          # save the Jetson some compute
+
+    def _set_qr_enable(self, on):
+        if self.pub_qr_enable is not None:
+            self.pub_qr_enable.publish(Int32(data=int(on)))
 
     def _on_enable(self, req, resp):
         self._start() if bool(req.enable) else self._stop()
@@ -368,7 +408,11 @@ class QRDockMapNode(Node):
         self._maybe_debug(frame)
         if base is None:
             return
-        mx, my, nyaw = base
+        self._on_qr_base(*base)
+
+    def _on_qr_base(self, mx, my, nyaw):
+        """Common handler: QR pose (x, y, outward-normal yaw) in base_link.
+        Fed by both the internal detector and the external /qr/pose path."""
         self.last_qr_base = (mx, my, nyaw)
         self.last_qr_t = self._now()
 
@@ -384,6 +428,48 @@ class QRDockMapNode(Node):
             qy = ry + s * mx + c * my
             qyaw = wrap_to_pi(rth + nyaw)
             self.obs.append((qx, qy, qyaw))
+
+    # ---- external on-Jetson /qr/pose path -------------------------------- #
+    def _on_qr_data(self, msg):
+        self.last_qr_payload_id = self._parse_qr_id(msg.data)
+
+    def _on_qr_pose(self, msg):
+        # Optional filter by payload id (e.g. the dock QR specifically).
+        if self.target_qr_id and self.last_qr_payload_id != self.target_qr_id:
+            return
+        # Transform the camera-frame QR pose into base_link via TF.
+        try:
+            p_base = self.tf_buffer.transform(
+                msg, self.base_frame, timeout=Duration(seconds=0.1))
+        except Exception as e:
+            self.get_logger().warn(f"TF {msg.header.frame_id}->{self.base_frame}: {e}",
+                                   throttle_duration_sec=2.0)
+            return
+        mx = p_base.pose.position.x
+        my = p_base.pose.position.y
+        q = p_base.pose.orientation
+        nx, ny = self._quat_axis_xy(q, self.qr_normal_axis)
+        # The outward normal must point back toward the robot (-x in base);
+        # flip if the chosen axis points the other way.
+        if nx > 0.0:
+            nx, ny = -nx, -ny
+        self._on_qr_base(float(mx), float(my), math.atan2(ny, nx))
+
+    @staticmethod
+    def _parse_qr_id(text):
+        if not text:
+            return None
+        m = re.search(r'"id"\s*:\s*"?([^",}\s]+)', text)   # JSON {"id": N}
+        return m.group(1) if m else text.strip()
+
+    @staticmethod
+    def _quat_axis_xy(q, axis):
+        """XY components of the QR's outward-face axis ('x' or 'z') in the
+        target frame, given the QR orientation quaternion."""
+        x, y, z, w = q.x, q.y, q.z, q.w
+        if axis == "z":          # 3rd column of R
+            return 2 * (x * z + y * w), 2 * (y * z - x * w)
+        return 1 - 2 * (y * y + z * z), 2 * (x * y + z * w)   # 'x': 1st column
 
     def _detect_qr_base(self, frame):
         data, points, _ = self.qr_det.detectAndDecode(frame)
@@ -572,6 +658,7 @@ class QRDockMapNode(Node):
             if not self.done_latched:
                 self.pub_done.publish(Bool(data=True))
                 self.done_latched = True
+                self._set_qr_enable(0)
                 self.get_logger().info(f"COMMIT done ({traveled:.3f} m). /align/done=true.")
             return
         self._publish_cmd(self.commit_speed, 0.0)

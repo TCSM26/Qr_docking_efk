@@ -35,10 +35,40 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, CompressedImage
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Twist, TransformStamped
-from std_msgs.msg import Bool
+from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
+from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
+
+
+def rmat_to_quat(R):
+    """Rotation matrix -> (x, y, z, w)."""
+    t = np.trace(R)
+    if t > 0.0:
+        s = math.sqrt(t + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return x, y, z, w
 
 
 def build_cam_extrinsics(x, y, z, pitch_rad):
@@ -161,6 +191,16 @@ class QRSimWorld(Node):
         self.pub_img_c = self.create_publisher(
             CompressedImage, self.image_topic + "/compressed", sensor_qos)
         self.pub_odom = self.create_publisher(Odometry, self.odom_topic, 10)
+        # Emulate the on-Jetson QR node: camera->QR pose (+X out of face) and
+        # payload, so the docking node's external-pose path can be tested.
+        self.declare_parameter("publish_qr_pose", True)
+        from rcl_interfaces.msg import ParameterDescriptor
+        self.declare_parameter("qr_id", "1",
+                               ParameterDescriptor(dynamic_typing=True))
+        self.publish_qr_pose = bool(g("publish_qr_pose"))
+        self.qr_id = str(g("qr_id"))
+        self.pub_qrpose = self.create_publisher(PoseStamped, "/qr/pose", 10)
+        self.pub_qrdata = self.create_publisher(String, "/qr/data", 10)
         self.sub_cmd = self.create_subscription(
             Twist, self.cmd_vel_topic, self._on_cmd, 10)
         self.sub_done = self.create_subscription(
@@ -186,6 +226,22 @@ class QRSimWorld(Node):
                          math.radians(float(g("loc_bias_yaw_deg"))))
         self.loc_drift = (float(g("loc_drift_x")), float(g("loc_drift_y")))
         self.loc_jitter = float(g("loc_jitter_m"))
+
+        # Static base_footprint -> camera (camera-optical pose in base, = T_base_cam),
+        # so the external /qr/pose (stamped in 'camera') is TF-resolvable.
+        b2c = TransformStamped()
+        b2c.header.stamp = self.get_clock().now().to_msg()
+        b2c.header.frame_id = "base_footprint"
+        b2c.child_frame_id = "camera"
+        b2c.transform.translation.x = float(self.T_base_cam[0, 3])
+        b2c.transform.translation.y = float(self.T_base_cam[1, 3])
+        b2c.transform.translation.z = float(self.T_base_cam[2, 3])
+        cqx, cqy, cqz, cqw = rmat_to_quat(self.T_base_cam[:3, :3])
+        b2c.transform.rotation.x = cqx
+        b2c.transform.rotation.y = cqy
+        b2c.transform.rotation.z = cqz
+        b2c.transform.rotation.w = cqw
+        self.static_bcast.sendTransform(b2c)
 
         dt = 1.0 / float(g("fps"))
         self.dt = dt
@@ -277,6 +333,40 @@ class QRSimWorld(Node):
         return img
 
     # ------------------------------------------------------------------ #
+    def _publish_qr_pose(self, stamp):
+        T_wc = T_world_base(self.rx, self.ry, self.rth) @ self.T_base_cam
+        Rwc, twc = T_wc[:3, :3], T_wc[:3, 3]
+        C = np.array([self.qr_x, self.qr_y, self.qr_z])
+        p_cam = Rwc.T @ (C - twc)
+        Z = p_cam[2]
+        if Z <= 0.1:
+            return  # behind camera -> "not detected"
+        u = self.fx * p_cam[0] / Z + self.cx
+        v = self.fy * p_cam[1] / Z + self.cy
+        if not (-20 <= u <= self.W + 20 and -20 <= v <= self.H + 20):
+            return  # out of frame -> "not detected"
+        # QR orientation in world (+X out of face, +Z up), then into camera.
+        nrm = self.qr_normal_yaw
+        Xax = np.array([math.cos(nrm), math.sin(nrm), 0.0])
+        Zax = np.array([0.0, 0.0, 1.0])
+        Yax = np.cross(Zax, Xax)
+        R_world_qr = np.column_stack((Xax, Yax, Zax))
+        R_cam_qr = Rwc.T @ R_world_qr
+        qx, qy, qz, qw = rmat_to_quat(R_cam_qr)
+
+        ps = PoseStamped()
+        ps.header.stamp = stamp
+        ps.header.frame_id = "camera"
+        ps.pose.position.x = float(p_cam[0])
+        ps.pose.position.y = float(p_cam[1])
+        ps.pose.position.z = float(p_cam[2])
+        ps.pose.orientation.x = qx
+        ps.pose.orientation.y = qy
+        ps.pose.orientation.z = qz
+        ps.pose.orientation.w = qw
+        self.pub_qrpose.publish(ps)
+        self.pub_qrdata.publish(String(data='{"id": "%s"}' % self.qr_id))
+
     def _on_cmd(self, msg):
         self.v = float(msg.linear.x)
         self.w = float(msg.angular.z)
@@ -372,6 +462,10 @@ class QRSimWorld(Node):
         cmsg = self.bridge.cv2_to_compressed_imgmsg(img, dst_format="jpg")
         cmsg.header = msg.header
         self.pub_img_c.publish(cmsg)
+
+        # Emulate the on-Jetson /qr/pose + /qr/data (camera->QR, +X out of face).
+        if self.publish_qr_pose:
+            self._publish_qr_pose(od.header.stamp)
 
         if (now - self.last_log) > 1.0 and not self.done:
             self.last_log = now
